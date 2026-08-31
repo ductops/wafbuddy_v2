@@ -1,4 +1,4 @@
-
+<img width="800" height="1051" alt="wafbuddy_dashboard" src="https://github.com/user-attachments/assets/0430ab34-7a15-4163-b532-06fcffa9f7cb" />
 
 # 🛡️ WAFBUDDY_v2 Migration Investigator
 
