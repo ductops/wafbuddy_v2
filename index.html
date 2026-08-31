@@ -471,12 +471,171 @@ function originProbeScript(){
  const port=$('#oiPort')?.value||'443';
  const path=$('#oiPath')?.value.trim()||'/';
  const host=$('#oiHost')?.value.trim()||h;
- return `#!/usr/bin/env bash\nset -euo pipefail\nPROTECTED=${JSON.stringify(h)}\nORIGIN=${JSON.stringify(oh)}\nPORT=${JSON.stringify(port)}\nPATH_Q=${JSON.stringify(path)}\nHOST_HEADER=${JSON.stringify(host)}\nTMP_H=$(mktemp); TMP_B=$(mktemp); TMP_C=$(mktemp)\ntrap 'rm -f "$TMP_H" "$TMP_B" "$TMP_C"' EXIT\n# --resolve forces the selected address while preserving URL host, HTTP Host, and TLS SNI.\nRESOLVE=()\nif [[ "$ORIGIN" =~ ^[0-9a-fA-F:.]+$ ]]; then RESOLVE=(--resolve "$HOST_HEADER:$PORT:$ORIGIN"); fi\nURL="https://$HOST_HEADER:$PORT$PATH_Q"\ncurl -skS "\${RESOLVE[@]}" -D "$TMP_H" -o "$TMP_B" --connect-timeout 10 --max-time 70 \\\n  -w '{"status":%{http_code},"remote_ip":"%{remote_ip}","local_ip":"%{local_ip}","http_version":"%{http_version}","time_namelookup":%{time_namelookup},"time_connect":%{time_connect},"time_appconnect":%{time_appconnect},"time_starttransfer":%{time_starttransfer},"time_total":%{time_total},"size_download":%{size_download}}' \\\n  "$URL" > "$TMP_C"\nopenssl s_client -connect "$ORIGIN:$PORT" -servername "$HOST_HEADER" -verify_return_error </dev/null 2>&1 | awk '\n/subject=/{sub(/^.*subject=/,"");subject=$0}\n/issuer=/{sub(/^.*issuer=/,"");issuer=$0}\n/Protocol *:/{protocol=$3}\n/Cipher *:/{cipher=$3}\n/Verify return code:/{verify=$0}\nEND{gsub(/"/,"\\\\\"",subject);gsub(/"/,"\\\\\"",issuer);gsub(/"/,"\\\\\"",verify);printf "{\\\"subject\\\":\\\"%s\\\",\\\"issuer\\\":\\\"%s\\\",\\\"protocol\\\":\\\"%s\\\",\\\"cipher\\\":\\\"%s\\\",\\\"verify_result\\\":\\\"%s\\\"}",subject,issuer,protocol,cipher,verify}' > /tmp/tls_probe.json\npython3 - "$TMP_C" "$TMP_H" /tmp/tls_probe.json "$ORIGIN" "$HOST_HEADER" <<'PY'\nimport json,sys\nmetrics=json.load(open(sys.argv[1])); headers={}\nfor line in open(sys.argv[2],errors='replace'):\n    if ':' in line:\n        k,v=line.split(':',1); headers[k.strip().lower()]=v.strip()\nmetrics['headers']=headers; metrics['location']=headers.get('location',''); metrics['tls']=json.load(open(sys.argv[3])); metrics['origin_host']=sys.argv[4]; metrics['host_header']=sys.argv[5]\nprint(json.dumps(metrics,indent=2))\nPY`;
+ return `#!/usr/bin/env bash
+set -u
+
+PROTECTED=${JSON.stringify(h)}
+ORIGIN=${JSON.stringify(oh)}
+PORT=${JSON.stringify(port)}
+PATH_Q=${JSON.stringify(path)}
+HOST_HEADER=${JSON.stringify(host)}
+
+TMP_H=$(mktemp)
+TMP_B=$(mktemp)
+TMP_C=$(mktemp)
+TMP_TLS=$(mktemp)
+trap 'rm -f "$TMP_H" "$TMP_B" "$TMP_C" "$TMP_TLS"' EXIT
+
+echo "=== WAF Migration Investigator Origin Probe ===" >&2
+echo "[1/4] HTTP / origin request" >&2
+
+# --resolve forces the selected address while preserving URL host, HTTP Host, and TLS SNI.
+RESOLVE=()
+if [[ "$ORIGIN" =~ ^[0-9a-fA-F:.]+$ ]]; then
+  RESOLVE=(--resolve "$HOST_HEADER:$PORT:$ORIGIN")
+fi
+
+URL="https://$HOST_HEADER:$PORT$PATH_Q"
+
+set +e
+curl -skS "\${RESOLVE[@]}" \
+  -D "$TMP_H" \
+  -o "$TMP_B" \
+  --connect-timeout 10 \
+  --max-time 70 \
+  -w '{"status":%{http_code},"remote_ip":"%{remote_ip}","local_ip":"%{local_ip}","http_version":"%{http_version}","time_namelookup":%{time_namelookup},"time_connect":%{time_connect},"time_appconnect":%{time_appconnect},"time_starttransfer":%{time_starttransfer},"time_total":%{time_total},"size_download":%{size_download}}' \
+  "$URL" > "$TMP_C"
+CURL_RC=$?
+set -e
+
+echo "[2/4] TLS handshake / certificate capture" >&2
+set +e
+openssl s_client \
+  -connect "$ORIGIN:$PORT" \
+  -servername "$HOST_HEADER" \
+  -verify_return_error \
+  -showcerts </dev/null > "$TMP_TLS" 2>&1
+TLS_RC=$?
+set -e
+
+echo "[3/4] TLS parser" >&2
+python3 - "$TMP_C" "$TMP_H" "$TMP_TLS" "$ORIGIN" "$HOST_HEADER" "$CURL_RC" "$TLS_RC" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+metrics_file, headers_file, tls_file, origin, host_header, curl_rc, tls_rc = sys.argv[1:8]
+
+def read_text(path):
+    return Path(path).read_text(errors="replace")
+
+# HTTP metrics: preserve useful output even when curl returned a non-zero code.
+try:
+    raw_metrics = read_text(metrics_file).strip()
+    metrics = json.loads(raw_metrics) if raw_metrics else {}
+    http_parser_ok = True
+except Exception as exc:
+    metrics = {"status": 0}
+    http_parser_ok = False
+    metrics["http_parser_error"] = str(exc)
+
+headers = {}
+for line in read_text(headers_file).splitlines():
+    if ":" in line:
+        key, value = line.split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+
+tls_raw = read_text(tls_file)
+
+def first(pattern, text, flags=re.I | re.M):
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else ""
+
+# OpenSSL output differs slightly by version, so accept both old/new formats.
+subject = first(r"^subject\s*=\s*(.+)$", tls_raw)
+issuer = first(r"^issuer\s*=\s*(.+)$", tls_raw)
+protocol = (
+    first(r"^\s*Protocol\s*:\s*(.+)$", tls_raw)
+    or first(r"^\s*New,\s*([^,]+),", tls_raw)
+)
+cipher = (
+    first(r"^\s*Cipher\s*:\s*(.+)$", tls_raw)
+    or first(r"^\s*Cipher is\s+(.+)$", tls_raw)
+)
+verify_result = first(r"^\s*Verify return code:\s*(.+)$", tls_raw)
+
+# If available, extract the leaf cert through OpenSSL itself and ask it for SAN/dates.
+san = ""
+not_before = ""
+not_after = ""
+cert_match = re.search(
+    r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+    tls_raw,
+    re.S,
+)
+if cert_match:
+    import subprocess
+    try:
+        cert = cert_match.group(0).encode()
+        cp = subprocess.run(
+            ["openssl", "x509", "-noout", "-dates", "-ext", "subjectAltName"],
+            input=cert,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        cert_info = cp.stdout.decode(errors="replace")
+        not_before = first(r"^notBefore=(.+)$", cert_info)
+        not_after = first(r"^notAfter=(.+)$", cert_info)
+        san_match = re.search(r"X509v3 Subject Alternative Name:\s*\n\s*(.+)", cert_info, re.I)
+        if san_match:
+            san = san_match.group(1).strip()
+    except Exception:
+        pass
+
+tls_parser_ok = bool(subject or issuer or protocol or cipher or verify_result or cert_match)
+
+metrics["headers"] = headers
+metrics["location"] = headers.get("location", "")
+metrics["origin_host"] = origin
+metrics["host_header"] = host_header
+metrics["tls"] = {
+    "subject": subject,
+    "issuer": issuer,
+    "protocol": protocol,
+    "cipher": cipher,
+    "verify_result": verify_result,
+    "san": san,
+    "not_before": not_before,
+    "not_after": not_after,
+}
+
+metrics["probe_checks"] = {
+    "http_command": "ok" if int(curl_rc) == 0 else f"curl exit {curl_rc}",
+    "http_parser": "ok" if http_parser_ok else "failed",
+    "tls_command": "ok" if int(tls_rc) == 0 else f"openssl exit {tls_rc}",
+    "tls_parser": "ok" if tls_parser_ok else "no TLS fields parsed",
+}
+
+# A non-zero openssl exit may simply mean certificate verification failed.
+# Preserve the evidence rather than aborting the entire diagnostic.
+print(json.dumps(metrics, indent=2))
+PY
+
+PY_RC=$?
+if [[ "$PY_RC" -eq 0 ]]; then
+  echo "[4/4] Probe JSON assembled successfully" >&2
+else
+  echo "[4/4] Probe JSON assembly FAILED (python exit $PY_RC)" >&2
+  exit "$PY_RC"
+fi
+`;
 }
 function renderOriginIntel(){
  const h=primaryHost(); const p=S.originProbe;
  const es=focusEntries(); const apis=apiInventory(es);
- $('#originIntelContent').innerHTML=`${sourceNote('focus')}<div class="panel"><h2>Origin Intelligence</h2><div class="callout"><b>Purpose:</b> combine the protected browser HAR with an authorized direct-origin probe. This exposes contradictions in hostname, SNI, certificate chain, redirects, cache layers, headers, timing, and virtual-host selection.</div><div class="origin-form" style="margin-top:14px"><label>Protected hostname<input id="oiProtected" value="${esc(h)}" placeholder="app.example.com"></label><label>Origin IP or DNS name<input id="oiOrigin" value="${esc(p?.origin_host||'')}" placeholder="10.0.2.15 or origin.example.net"></label><label>Origin port<input id="oiPort" value="443"></label><label>Test path<input id="oiPath" value="/" placeholder="/health or /api/status"></label><label class="span-2">Expected HTTP Host / TLS SNI<input id="oiHost" value="${esc(p?.host_header||h)}" placeholder="app.example.com"></label><label class="span-2">Topology<select id="oiTopology"><option>WAF → NGINX origin</option><option>WAF → CDN → NGINX</option><option>WAF → load balancer → NGINX</option><option>WAF → API gateway / service mesh</option></select></label><div class="span-4"><div class="copyrow"><b>Generated origin probe</b><button class="btn" id="oiGenerate">Refresh script</button></div><div class="code" id="oiScript">${esc(originProbeScript())}</div></div><label class="span-4">Paste returned JSON<textarea id="oiJson" placeholder='{"status":200,"remote_ip":"10.0.2.15","headers":{"server":"nginx"},"tls":{"subject":"CN=app.example.com","verify_result":"Verify return code: 0 (ok)"}}'>${esc(p?JSON.stringify(p,null,2):'')}</textarea></label><div class="span-4"><button class="btn primary" id="oiAnalyze">Analyze origin evidence</button> <button class="btn" id="oiDemo">Load origin demo</button> <span class="tiny" id="oiMsg"></span></div></div></div>
+ $('#originIntelContent').innerHTML=`${sourceNote('focus')}<div class="panel"><h2>Origin Intelligence</h2><div class="callout"><b>Purpose:</b> combine the protected browser HAR with an authorized direct-origin probe. This exposes contradictions in hostname, SNI, certificate chain, redirects, cache layers, headers, timing, and virtual-host selection.</div><div class="origin-form" style="margin-top:14px"><label>Protected hostname<input id="oiProtected" value="${esc(h)}" placeholder="app.example.com"></label><label>Origin IP or DNS name<input id="oiOrigin" value="${esc(p?.origin_host||'')}" placeholder="10.0.2.15 or origin.example.net"></label><label>Origin port<input id="oiPort" value="443"></label><label>Test path<input id="oiPath" value="/" placeholder="/health or /api/status"></label><label class="span-2">Expected HTTP Host / TLS SNI<input id="oiHost" value="${esc(p?.host_header||h)}" placeholder="app.example.com"></label><label class="span-2">Topology<select id="oiTopology"><option>WAF → NGINX origin</option><option>WAF → CDN → NGINX</option><option>WAF → load balancer → NGINX</option><option>WAF → API gateway / service mesh</option></select></label><div class="span-4"><div class="copyrow"><b>Generated origin probe</b><button class="btn" id="oiGenerate">Refresh script</button></div><div class="tiny" style="margin:5px 0 7px"><b>Probe self-check:</b> generated JSON now includes <code>probe_checks</code> so HTTP command, HTTP parsing, TLS command, and TLS parsing are reported independently.</div><div class="code" id="oiScript">${esc(originProbeScript())}</div></div><label class="span-4">Paste returned JSON<textarea id="oiJson" placeholder='{"status":200,"remote_ip":"10.0.2.15","headers":{"server":"nginx"},"tls":{"subject":"CN=app.example.com","verify_result":"Verify return code: 0 (ok)"}}'>${esc(p?JSON.stringify(p,null,2):'')}</textarea></label><div class="span-4"><button class="btn primary" id="oiAnalyze">Analyze origin evidence</button> <button class="btn" id="oiDemo">Load origin demo</button> <span class="tiny" id="oiMsg"></span></div></div></div>
  ${es.length?`<div class="panel"><h2>Discovered host and path surface</h2><p class="tiny">This is an inventory inferred from browser traffic—not an API scanner. It helps choose representative health, static, login, upload, and API paths for direct-origin testing.</p><div class="table-wrap"><table><thead><tr><th>Method</th><th>Path family</th><th>Requests</th><th>Status seen</th><th>Max time</th></tr></thead><tbody>${apis.map(x=>`<tr><td>${esc(x.method)}</td><td><code>${esc(x.family)}</code></td><td>${x.count}</td><td>${esc([...x.status].join(', '))}</td><td>${fmt(x.max)}</td></tr>`).join('')}</tbody></table></div></div>`:''}
  ${p?`<div class="panel"><h2>Protected-to-origin contract comparison</h2>${originContractRows()}</div><div class="panel"><h2>Design and configuration callouts</h2>${originRecommendations().map(([sev,t,d])=>`<div class="finding"><span class="sev ${sev==='high'?'high':sev==='med'?'med':'info'}"></span><div><h4>${esc(t)}</h4><p>${esc(d)}</p></div><span class="pill ${sev==='high'?'red':sev==='med'?'amber':'blue'}">${sev}</span></div>`).join('')}</div>`:`<div class="empty">Import the generated JSON to compare origin behavior with the protected HAR.</div>`}
  <div class="panel"><h2>NGINX + CloudFront-shaped troubleshooting model</h2><div class="checks"><div class="check"><b>Host and SNI are separate contracts</b><span class="tiny">The TLS SNI selects a certificate/site before HTTP exists; the Host header selects the HTTP virtual host afterward. Test both deliberately with <code>--resolve</code>.</span></div><div class="check"><b>Layer ownership</b><span class="tiny">When a CDN remains behind the WAF, define which layer owns redirects, cache policy, compression, CORS, security headers, request IDs, and custom origin authentication.</span></div><div class="check"><b>Health path must be boring</b><span class="tiny">Use a lightweight unauthenticated path with stable 200 response, minimal dependencies, expected Host handling, and no canonical redirect loop.</span></div><div class="check"><b>Origin access boundary</b><span class="tiny">Allow only required WAF SaaS egress ranges or an approved private route. At NGINX, trust forwarded client identity only from those immediate proxy sources.</span></div><div class="check"><b>NGINX upstream telemetry</b><span class="tiny">Log <code>$host</code>, forwarded headers, <code>$request_time</code>, <code>$upstream_connect_time</code>, <code>$upstream_header_time</code>, <code>$upstream_response_time</code>, and a request ID.</span></div><div class="check"><b>Path normalization</b><span class="tiny">Compare encoded slashes, duplicate slashes, trailing slash behavior, query strings, large headers, uploads, WebSocket upgrades, and API methods—not only <code>GET /</code>.</span></div></div></div>`;
