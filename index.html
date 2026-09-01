@@ -320,7 +320,70 @@ if (Get-Module -ListAvailable WebAdministration) {
 if(platform==='linux')return `#!/usr/bin/env sh\nHOST='${host}'\nURL='${url}'\n\necho '=== DNS ==='\n(getent ahosts \"$HOST\" 2>/dev/null || dig +short \"$HOST\" || nslookup \"$HOST\")\n\necho '=== HTTP + CACHE + RATE + PROXY HEADERS ==='\ncurl -skS -o /dev/null -D - -w 'DNS:%{time_namelookup} CONNECT:%{time_connect} TLS:%{time_appconnect} TTFB:%{time_starttransfer} TOTAL:%{time_total} STATUS:%{http_code} REMOTE:%{remote_ip}\\n' \"$URL\"\n\necho '=== TLS / SNI ==='\necho | openssl s_client -connect \"$HOST:443\" -servername \"$HOST\" -showcerts 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null\n\necho '=== REDIRECT JOURNEY ==='\ncurl -skS -I -L --max-redirs 8 \"$URL\" | grep -Ei '^(HTTP/|location:|server:|via:|cache-control:|age:|x-cache:|cf-cache-status:|retry-after:|ratelimit-|x-ratelimit-|set-cookie:)'`;
 return `# Cross-platform curl — WAF Migration Investigator Quick Probe\n# Run from an authorized workstation/server near the affected path.\n\n# 1) Headers + timing\ncurl -skS -o /dev/null -D - -w 'DNS:%{time_namelookup} CONNECT:%{time_connect} TLS:%{time_appconnect} TTFB:%{time_starttransfer} TOTAL:%{time_total} STATUS:%{http_code} REMOTE:%{remote_ip}\\n' '${url}'\n\n# 2) Redirect / proxy / cache journey\ncurl -skS -I -L --max-redirs 8 '${url}'\n\n# 3) Cache repeat — look for MISS → HIT and Age growth\nfor i in 1 2 3 4 5; do curl -skS -o /dev/null -D - '${url}' | grep -Ei '^(HTTP/|age:|cache-control:|x-cache:|cf-cache-status:|via:|server:)'; done\n\n# 4) TLS / certificate / SNI (if openssl is installed)\necho | openssl s_client -connect '${host}:443' -servername '${host}' -showcerts 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName 2>/dev/null`}
 function updateQp(){const h=cleanProbeHost($('#qpDomain')?.value||'');if($('#qpCommand'))$('#qpCommand').textContent=qpCommand();if($('#qpTargetHint'))$('#qpTargetHint').textContent=`Probe target: ${h||'—'}`}
-function analyzeQp(){const raw=$('#qpOutput').value||'';const host=($('#qpDomain').value||'').trim();if(!raw.trim()){ $('#qpResult').innerHTML='<div class="callout warn" style="margin-top:10px">Paste probe output first.</div>';return }const find=(re)=>{const m=raw.match(re);return m?m[1].trim():'—'};const statuses=[...raw.matchAll(/(?:HTTP\/\S+\s+|HTTP_STATUS:\s*)(\d{3})/gi)].map(m=>m[1]);const ev={host,statuses,server:find(/^server:\s*(.+)$/im),via:find(/^via:\s*(.+)$/im),cache:find(/^(?:x-cache|cf-cache-status):\s*(.+)$/im),cacheControl:find(/^cache-control:\s*(.+)$/im),location:find(/^location:\s*(.+)$/im),retry:find(/^retry-after:\s*(.+)$/im),remote:find(/REMOTE:([^\s]+)/i),subject:find(/^subject\s*=*\s*(.+)$/im),issuer:find(/^issuer\s*=*\s*(.+)$/im),raw};S.domainEvidence=ev;const bad=statuses.some(x=>Number(x)>=500),rate=statuses.includes('429');$('#qpResult').innerHTML=`<div class="probe-summary"><div class="check"><b>Status</b><span class="tiny">${statuses.length?esc([...new Set(statuses)].join(', ')):'No HTTP status parsed'}</span></div><div class="check"><b>Server / proxy</b><span class="tiny">${esc(ev.server)}${ev.via!=='—'?` · Via ${esc(ev.via)}`:''}</span></div><div class="check"><b>Cache</b><span class="tiny">${esc(ev.cache)} · ${esc(ev.cacheControl)}</span></div></div>${bad?'<div class="callout bad" style="margin-top:10px"><b>5xx evidence found:</b> move next to origin reachability, Host/SNI, certificate trust, upstream timing, and backend logs.</div>':''}${rate?`<div class="callout warn" style="margin-top:10px"><b>429 found:</b> Retry-After ${esc(ev.retry)}. Validate rate-key identity and X-Forwarded-For handling.</div>`:''}<div class="why"><b>Why it matters:</b> this gives Investigator useful evidence even when a HAR cannot be exchanged. It is intentionally a clue bundle—not a substitute for WAF, proxy, or origin logs.</div>`;$('#statusline').textContent=`Domain probe evidence parsed for ${host||'target'}.`}
+function analyzeQp(){
+ const raw=$('#qpOutput').value||'',host=($('#qpDomain').value||'').trim();
+ if(!raw.trim()){ $('#qpResult').innerHTML='<div class="callout warn" style="margin-top:10px">Paste probe output first.</div>';return }
+ const all=(re)=>[...raw.matchAll(re)].map(m=>(m[1]??'').trim()).filter(Boolean);
+ const first=(re,def='—')=>{const m=raw.match(re);return m?(m[1]??'').trim():def};
+ const uniq=a=>[...new Set(a.filter(Boolean))];
+ const statuses=uniq(all(/(?:HTTP\/\S+\s+|HTTP_STATUS:\s*)(\d{3})/gi));
+ const servers=uniq(all(/^server:\s*(.+)$/gim));
+ const vias=uniq(all(/^via:\s*(.+)$/gim));
+ const caches=uniq(all(/^(?:x-cache|cf-cache-status|x-cache-status):\s*(.+)$/gim));
+ const pops=uniq(all(/^x-amz-cf-pop:\s*(.+)$/gim));
+ const cfids=uniq(all(/^x-amz-cf-id:\s*(.+)$/gim));
+ const origins=uniq(all(/^x-(?:ws-)?origin(?:-status|-node)?:\s*(.+)$/gim));
+ const powered=uniq(all(/^x-powered-by:\s*(.+)$/gim));
+ const cacheControls=uniq(all(/^cache-control:\s*(.+)$/gim));
+ const locations=uniq(all(/^location:\s*(.+)$/gim));
+ const retries=uniq(all(/^retry-after:\s*(.+)$/gim));
+ const limits=uniq(all(/^(?:ratelimit-limit|x-ratelimit-limit|x-rate-limit-limit|x-ws-ratelimit-limit):\s*(.+)$/gim));
+ const remaining=uniq(all(/^(?:ratelimit-remaining|x-ratelimit-remaining|x-rate-limit-remaining|x-ws-ratelimit-remaining):\s*(.+)$/gim));
+ const resets=uniq(all(/^(?:ratelimit-reset|x-ratelimit-reset|x-rate-limit-reset|x-ws-ratelimit-reset):\s*(.+)$/gim));
+ const subjects=uniq(all(/^subject\s*=*\s*(.+)$/gim));
+ const issuers=uniq(all(/^issuer\s*=*\s*(.+)$/gim));
+ const notBefore=uniq(all(/^notBefore\s*=\s*(.+)$/gim));
+ const notAfter=uniq(all(/^notAfter\s*=\s*(.+)$/gim));
+ const sans=uniq(all(/^\s*DNS:\s*(.+)$/gim));
+ const remote=first(/REMOTE:([^\s]+)/i);
+ const dns=first(/DNS:([0-9.]+)/i),connect=first(/CONNECT:([0-9.]+)/i),tls=first(/TLS:([0-9.]+)/i),ttfb=first(/TTFB:([0-9.]+)/i),total=first(/TOTAL:([0-9.]+)/i);
+ const timing={dns,connect,tls,ttfb,total};
+ const num=v=>{const n=Number(String(v).match(/-?\d+(?:\.\d+)?/)?.[0]);return Number.isFinite(n)?n:NaN};
+ const L=num(limits[0]),R=num(remaining[0]),used=(Number.isFinite(L)&&Number.isFinite(R)&&L>0)?L-R:NaN,usedPct=Number.isFinite(used)?Math.max(0,Math.min(100,used/L*100)):NaN;
+ const bad=statuses.some(x=>Number(x)>=500),rate429=statuses.includes('429');
+ const cloudfront=!!(pops.length||cfids.length||vias.some(v=>/cloudfront/i.test(v))||caches.some(v=>/cloudfront/i.test(v)));
+ const certPresent=subjects.length||issuers.length||notAfter.length||sans.length;
+ const ev={host,statuses,server:servers,via:vias,cache:caches,cacheControl:cacheControls,location:locations,retry:retries,remote,pop:pops,cfid:cfids,origin:origins,powered,rate:{limit:limits,remaining,resets,usedPct},certificate:{subject:subjects,issuer:issuers,notBefore,notAfter,san:sans},timing,raw};
+ S.domainEvidence=ev;
+
+ const cards=[];
+ cards.push(`<div class="check"><b>Status</b><span class="tiny">${statuses.length?esc(statuses.join(', ')):'No HTTP status parsed'}</span></div>`);
+ cards.push(`<div class="check"><b>Server / proxy</b><span class="tiny">${esc(servers.join(' · ')||'—')}${vias.length?` · Via ${esc(vias[0])}`:''}</span></div>`);
+ cards.push(`<div class="check"><b>Cache</b><span class="tiny">${esc(caches.join(' · ')||'—')}${cacheControls.length?` · ${esc(cacheControls[0])}`:''}</span></div>`);
+ cards.push(`<div class="check"><b>Origin signal</b><span class="tiny">${esc(origins.join(' · ')||'—')}</span></div>`);
+ cards.push(`<div class="check"><b>CDN edge</b><span class="tiny">${cloudfront?'CloudFront':''}${pops.length?` · POP ${esc(pops.join(', '))}`:''}${!cloudfront&&!pops.length?'—':''}</span></div>`);
+ cards.push(`<div class="check"><b>Rate budget</b><span class="tiny">${limits.length?`Limit ${esc(limits[0])}`:'—'}${remaining.length?` · Remaining ${esc(remaining[0])}`:''}${Number.isFinite(usedPct)?` · ${usedPct.toFixed(1)}% consumed`:''}</span></div>`);
+ cards.push(`<div class="check"><b>Remote IP</b><span class="tiny">${esc(remote)}</span></div>`);
+ cards.push(`<div class="check"><b>Application clue</b><span class="tiny">${esc(powered.join(' · ')||'—')}</span></div>`);
+
+ const timingTable=`<div class="panel" style="margin-top:10px"><h3>Timing breakdown</h3><div class="kv"><div>DNS</div><div>${esc(dns)} s</div><div>Connect</div><div>${esc(connect)} s</div><div>TLS</div><div>${esc(tls)} s</div><div>TTFB</div><div>${esc(ttfb)} s</div><div>Total</div><div>${esc(total)} s</div></div><div class="tiny" style="margin-top:7px">TTFB compared with total helps separate backend/edge wait from download time. Compare repeated probes and before/after captures rather than judging from one sample alone.</div></div>`;
+
+ const certHtml=certPresent?`<div class="panel" style="margin-top:10px"><h3>TLS / certificate evidence</h3><div class="kv"><div>Subject</div><div>${esc(subjects.join(' · ')||'—')}</div><div>Issuer</div><div>${esc(issuers.join(' · ')||'—')}</div><div>Valid from</div><div>${esc(notBefore.join(' · ')||'—')}</div><div>Valid until</div><div>${esc(notAfter.join(' · ')||'—')}</div><div>SAN</div><div>${esc(sans.join(', ')||'—')}</div></div></div>`:'';
+
+ const rateHtml=(limits.length||remaining.length||rate429)?`<div class="enforce-panel"><div class="enforce-head"><div><h3>🚦 Rate-limit evidence</h3><div class="tiny">Parsed directly from the returned probe headers.</div></div><div class="enforce-badges"><span class="pill ${rate429?'red':'blue'}">${rate429?'429 enforced':'Budget visible'}</span></div></div><div class="enforce-grid"><div class="enforce-box"><div class="k">Limit</div><div class="v">${esc(limits[0]||'—')}</div></div><div class="enforce-box"><div class="k">Remaining</div><div class="v">${esc(remaining[0]||'—')}</div>${Number.isFinite(usedPct)?`<div class="quota-track"><i style="width:${usedPct}%"></i></div><div class="s">${usedPct.toFixed(1)}% consumed</div>`:''}</div><div class="enforce-box"><div class="k">Retry / reset</div><div class="v">${esc(retries[0]||resets[0]||'—')}</div></div></div><div class="enforce-story ${rate429?'bad':''}">${rate429?'<b>Enforcement observed:</b> HTTP 429 was returned. Correlate source identity and the matching rule before changing thresholds.':'<b>Budget observed, not enforcement:</b> the response exposes a rate-limit counter. Repeated probes can show whether Remaining decrements and whether different users share a counting key.'}</div></div>`:'';
+
+ const cdnHtml=cloudfront?`<div class="panel" style="margin-top:10px"><h3>☁️ CloudFront / edge evidence</h3><div class="kv"><div>POP</div><div>${esc(pops.join(', ')||'—')}</div><div>Cache</div><div>${esc(caches.join(' · ')||'—')}</div><div>Via</div><div>${esc(vias[0]||'—')}</div><div>Request IDs</div><div style="word-break:break-all">${esc(cfids.slice(0,3).join(' · ')||'—')}</div></div><div class="tiny" style="margin-top:7px">Repeated MISS responses are worth comparing with Cache-Control, cookies, query strings, and application behavior. A single MISS can be normal; persistent MISS on stable static content is more interesting.</div></div>`:'';
+
+ const clues=[];
+ if(origins.length)clues.push(`<b>Origin availability:</b> ${esc(origins.join(' · '))}`);
+ if(powered.length)clues.push(`<b>Backend/application fingerprint:</b> ${esc(powered.join(' · '))}`);
+ if(remote!=='—')clues.push(`<b>Connected edge IP:</b> ${esc(remote)}`);
+ if(Number(ttfb)!==NaN && Number(total)!==NaN)clues.push(`<b>Timing:</b> TTFB ${esc(ttfb)}s of ${esc(total)}s total`);
+ const clueHtml=clues.length?`<div class="callout" style="margin-top:10px">${clues.join('<br>')}</div>`:'';
+
+ $('#qpResult').innerHTML=`<div class="probe-summary">${cards.join('')}</div>${rateHtml}${cdnHtml}${timingTable}${certHtml}${clueHtml}${bad?'<div class="callout bad" style="margin-top:10px"><b>5xx evidence found:</b> move next to origin reachability, Host/SNI, certificate trust, upstream timing, and backend logs.</div>':''}<div class="why"><b>Why it matters:</b> this parsed view preserves the rich evidence returned by the probe instead of collapsing it to status/server/cache. It is still a client-side clue bundle—not a substitute for WAF, CDN, proxy, or origin logs.</div>`;
+ $('#statusline').textContent=`Domain probe evidence parsed for ${host||'target'} · ${statuses.length} status code${statuses.length===1?'':'s'} · ${limits.length||remaining.length?'rate evidence · ':''}${certPresent?'certificate evidence · ':''}${cloudfront?'CloudFront evidence':''}`;
+}
 function useQpHost(){const h=cleanProbeHost($('#qpDomain').value||'');if(!h)return;['curlHost','oiHost'].forEach(id=>{const e=$('#'+id);if(e)e.value=h});const oh=$('#oiOrigin');if(oh&&!oh.value)oh.value=h;$('#statusline').textContent=`${h} copied into available Investigator host fields.`;quickProbeDialog.close()}
 
 function loadFile(file,slot){const r=new FileReader();r.onload=()=>{try{const har=JSON.parse(r.result);const es=normalize(har);S[slot]=har;S['file'+slot.toUpperCase()]=file.name;S['entries'+slot.toUpperCase()]=es;S['analysis'+slot.toUpperCase()]=analyze(es);renderAll();$('#statusline').textContent=`${slot==='a'?'Primary / Protected':'Comparison / Before'}: ${file.name} · ${es.length} requests loaded locally`;}catch(e){alert(e.message)}};r.readAsText(file)}
@@ -498,7 +561,7 @@ fi
 URL="https://$HOST_HEADER:$PORT$PATH_Q"
 
 set +e
-curl -skS "\${RESOLVE[@]}" \
+curl -skS "${'${RESOLVE[@]}'}" \
   -D "$TMP_H" \
   -o "$TMP_B" \
   --connect-timeout 10 \
