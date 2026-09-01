@@ -174,7 +174,7 @@ h1{font-size:clamp(34px,4vw,52px);line-height:.98;margin:11px 0 9px;letter-spaci
  </div>
 </dialog>
 
-<dialog id="quickProbeDialog"><div class="modal-head"><div><b>Domain Quick Probe</b><div class="tiny">No HAR required. Generate a small evidence collection kit, run it locally, then paste the output back here.</div></div><button class="close" onclick="quickProbeDialog.close()">✕</button></div><div class="modal-body"><div class="callout"><b>Why this exists:</b> a browser page cannot safely inspect arbitrary domains, private origins, certificates, or network paths because of CORS and browser sandboxing. Instead, Investigator gives the customer a copy/paste probe that runs where the evidence actually lives.</div><div class="origin-form" style="margin-top:12px;grid-template-columns:minmax(240px,2fr) minmax(120px,1fr) minmax(190px,1fr)"><label>Domain / hostname<input id="qpDomain" placeholder="app.example.com"></label><label>Path<input id="qpPath" value="/"></label><label>Platform<select id="qpPlatform"><option value="curl">Cross-platform curl</option><option value="powershell">Windows PowerShell</option><option value="linux">Linux / shell</option></select></label></div><div class="quick-probe-grid" style="margin-top:12px"><div><div class="copyrow"><div><b>Customer-side probe</b><div class="tiny" id="qpTargetHint">Probe target: —</div></div><button class="btn" id="qpCopyBtn">Copy probe</button></div><div class="code" id="qpCommand">Enter a domain above.</div></div><div><b>Paste returned output</b><textarea id="qpOutput" placeholder="Paste command output here. Investigator will extract HTTP status, Server/Via, cache clues, redirects, rate-limit headers, and certificate hints where present."></textarea><div class="quick-probe-actions"><button class="btn primary" id="qpAnalyzeBtn">Analyze pasted evidence</button><button class="btn" id="qpUseHostBtn">Use hostname in test benches</button></div><div id="qpResult"></div></div></div></div></dialog>
+<dialog id="quickProbeDialog"><div class="modal-head"><div><b>Domain Quick Probe</b><div class="tiny">No HAR required. Generate a small evidence collection kit, run it locally, then paste the output back here.</div></div><button class="close" onclick="quickProbeDialog.close()">✕</button></div><div class="modal-body"><div class="callout"><b>Why this exists:</b> a browser page cannot safely inspect arbitrary domains, private origins, certificates, or network paths because of CORS and browser sandboxing. Instead, Investigator gives the customer a copy/paste probe that runs where the evidence actually lives.</div><div class="origin-form" style="margin-top:12px;grid-template-columns:minmax(240px,2fr) minmax(120px,1fr) minmax(190px,1fr)"><label>Domain / hostname<input id="qpDomain" placeholder="app.example.com"></label><label>Path<input id="qpPath" value="/"></label><label>Platform<select id="qpPlatform"><option value="curl">Cross-platform curl</option><option value="powershell">Windows PowerShell</option><option value="linux">Linux / shell</option></select></label></div><div class="quick-probe-grid" style="margin-top:12px"><div><div class="copyrow"><div><b>Customer-side probe</b><div class="tiny" id="qpTargetHint">Probe target: —</div></div><button class="btn" id="qpCopyBtn">Copy probe</button></div><div class="code" id="qpCommand">Enter a domain above.</div></div><div><b>Paste returned output</b><textarea id="qpOutput" placeholder="Paste the entire terminal output here — including probe progress lines. Investigator will automatically extract embedded JSON plus HTTP status, Server/Via, cache, rate-limit, timing, CDN, origin, and certificate evidence."></textarea><div class="quick-probe-actions"><button class="btn primary" id="qpAnalyzeBtn">Analyze pasted evidence</button><button class="btn" id="qpUseHostBtn">Use hostname in test benches</button></div><div id="qpResult"></div></div></div></div></dialog>
 <dialog id="detailDialog"><div class="modal-head"><div><b id="modalTitle">Request details</b><div class="tiny" id="modalSub"></div></div><button class="close" onclick="detailDialog.close()">✕</button></div><div class="modal-body" id="modalBody"></div></dialog>
 <script>
 const S={a:null,b:null,entriesA:[],entriesB:[],analysisA:null,analysisB:null,originProbe:null,serverGuide:'iis',aiMode:'all',fileA:null,fileB:null,domainEvidence:null,feedA:true,feedB:true,insightProvider:'generic'};
@@ -323,30 +323,64 @@ function updateQp(){const h=cleanProbeHost($('#qpDomain')?.value||'');if($('#qpC
 function analyzeQp(){
  const raw=$('#qpOutput').value||'',host=($('#qpDomain').value||'').trim();
  if(!raw.trim()){ $('#qpResult').innerHTML='<div class="callout warn" style="margin-top:10px">Paste probe output first.</div>';return }
+ const extractJson=(text)=>{
+   const marked=text.match(/=== WMI_ORIGIN_JSON_BEGIN ===\s*([\s\S]*?)\s*=== WMI_ORIGIN_JSON_END ===/);
+   if(marked){
+     try{return {obj:JSON.parse(marked[1]),mode:'marked'}}catch{}
+   }
+   // Backward-compatible fallback for older probes: scan for a balanced top-level JSON object.
+   const starts=[];
+   for(let i=0;i<text.length;i++)if(text[i]==='{')starts.push(i);
+   for(const st of starts){
+     let depth=0,inStr=false,escp=false;
+     for(let i=st;i<text.length;i++){
+       const ch=text[i];
+       if(inStr){
+         if(escp){escp=false;continue}
+         if(ch==='\\'){escp=true;continue}
+         if(ch==='"'){inStr=false}
+         continue
+       }
+       if(ch==='"'){inStr=true;continue}
+       if(ch==='{')depth++;
+       else if(ch==='}'){
+         depth--;
+         if(depth===0){
+           const candidate=text.slice(st,i+1);
+           try{return {obj:JSON.parse(candidate),mode:'balanced'}}catch{break}
+         }
+       }
+     }
+   }
+   return null;
+ };
+ const structured=extractJson(raw);
+ const sj=structured?.obj||null;
+
  const all=(re)=>[...raw.matchAll(re)].map(m=>(m[1]??'').trim()).filter(Boolean);
  const first=(re,def='—')=>{const m=raw.match(re);return m?(m[1]??'').trim():def};
  const uniq=a=>[...new Set(a.filter(Boolean))];
- const statuses=uniq(all(/(?:HTTP\/\S+\s+|HTTP_STATUS:\s*)(\d{3})/gi));
- const servers=uniq(all(/^server:\s*(.+)$/gim));
- const vias=uniq(all(/^via:\s*(.+)$/gim));
- const caches=uniq(all(/^(?:x-cache|cf-cache-status|x-cache-status):\s*(.+)$/gim));
- const pops=uniq(all(/^x-amz-cf-pop:\s*(.+)$/gim));
- const cfids=uniq(all(/^x-amz-cf-id:\s*(.+)$/gim));
- const origins=uniq(all(/^x-(?:ws-)?origin(?:-status|-node)?:\s*(.+)$/gim));
- const powered=uniq(all(/^x-powered-by:\s*(.+)$/gim));
+ const statuses=uniq([...(sj?.status?[String(sj.status)]:[]),...all(/(?:HTTP\/\S+\s+|HTTP_STATUS:\s*)(\d{3})/gi)]);
+ const servers=uniq([...(sj?.headers?.server?[String(sj.headers.server)]:[]),...all(/^server:\s*(.+)$/gim)]);
+ const vias=uniq([...(sj?.headers?.via?[String(sj.headers.via)]:[]),...all(/^via:\s*(.+)$/gim)]);
+ const caches=uniq([...(sj?.headers?.['x-cache']?[String(sj.headers['x-cache'])]:[]),...(sj?.headers?.['cf-cache-status']?[String(sj.headers['cf-cache-status'])]:[]),...all(/^(?:x-cache|cf-cache-status|x-cache-status):\s*(.+)$/gim)]);
+ const pops=uniq([...(sj?.headers?.['x-amz-cf-pop']?[String(sj.headers['x-amz-cf-pop'])]:[]),...all(/^x-amz-cf-pop:\s*(.+)$/gim)]);
+ const cfids=uniq([...(sj?.headers?.['x-amz-cf-id']?[String(sj.headers['x-amz-cf-id'])]:[]),...all(/^x-amz-cf-id:\s*(.+)$/gim)]);
+ const origins=uniq([...(sj?.headers?.['x-ws-origin']?[String(sj.headers['x-ws-origin'])]:[]),...all(/^x-(?:ws-)?origin(?:-status|-node)?:\s*(.+)$/gim)]);
+ const powered=uniq([...(sj?.headers?.['x-powered-by']?[String(sj.headers['x-powered-by'])]:[]),...all(/^x-powered-by:\s*(.+)$/gim)]);
  const cacheControls=uniq(all(/^cache-control:\s*(.+)$/gim));
  const locations=uniq(all(/^location:\s*(.+)$/gim));
- const retries=uniq(all(/^retry-after:\s*(.+)$/gim));
- const limits=uniq(all(/^(?:ratelimit-limit|x-ratelimit-limit|x-rate-limit-limit|x-ws-ratelimit-limit):\s*(.+)$/gim));
- const remaining=uniq(all(/^(?:ratelimit-remaining|x-ratelimit-remaining|x-rate-limit-remaining|x-ws-ratelimit-remaining):\s*(.+)$/gim));
+ const retries=uniq([...(sj?.headers?.['retry-after']?[String(sj.headers['retry-after'])]:[]),...all(/^retry-after:\s*(.+)$/gim)]);
+ const limits=uniq([...(sj?.headers?.['ratelimit-limit']?[String(sj.headers['ratelimit-limit'])]:[]),...(sj?.headers?.['x-ratelimit-limit']?[String(sj.headers['x-ratelimit-limit'])]:[]),...(sj?.headers?.['x-ws-ratelimit-limit']?[String(sj.headers['x-ws-ratelimit-limit'])]:[]),...all(/^(?:ratelimit-limit|x-ratelimit-limit|x-rate-limit-limit|x-ws-ratelimit-limit):\s*(.+)$/gim)]);
+ const remaining=uniq([...(sj?.headers?.['ratelimit-remaining']?[String(sj.headers['ratelimit-remaining'])]:[]),...(sj?.headers?.['x-ratelimit-remaining']?[String(sj.headers['x-ratelimit-remaining'])]:[]),...(sj?.headers?.['x-ws-ratelimit-remaining']?[String(sj.headers['x-ws-ratelimit-remaining'])]:[]),...all(/^(?:ratelimit-remaining|x-ratelimit-remaining|x-rate-limit-remaining|x-ws-ratelimit-remaining):\s*(.+)$/gim)]);
  const resets=uniq(all(/^(?:ratelimit-reset|x-ratelimit-reset|x-rate-limit-reset|x-ws-ratelimit-reset):\s*(.+)$/gim));
- const subjects=uniq(all(/^subject\s*=*\s*(.+)$/gim));
- const issuers=uniq(all(/^issuer\s*=*\s*(.+)$/gim));
- const notBefore=uniq(all(/^notBefore\s*=\s*(.+)$/gim));
- const notAfter=uniq(all(/^notAfter\s*=\s*(.+)$/gim));
+ const subjects=uniq([...(sj?.tls?.subject?[String(sj.tls.subject)]:[]),...all(/^subject\s*=*\s*(.+)$/gim)]);
+ const issuers=uniq([...(sj?.tls?.issuer?[String(sj.tls.issuer)]:[]),...all(/^issuer\s*=*\s*(.+)$/gim)]);
+ const notBefore=uniq([...(sj?.tls?.not_before?[String(sj.tls.not_before)]:[]),...all(/^notBefore\s*=\s*(.+)$/gim)]);
+ const notAfter=uniq([...(sj?.tls?.not_after?[String(sj.tls.not_after)]:[]),...all(/^notAfter\s*=\s*(.+)$/gim)]);
  const sans=uniq(all(/^\s*DNS:\s*(.+)$/gim));
- const remote=first(/REMOTE:([^\s]+)/i);
- const dns=first(/DNS:([0-9.]+)/i),connect=first(/CONNECT:([0-9.]+)/i),tls=first(/TLS:([0-9.]+)/i),ttfb=first(/TTFB:([0-9.]+)/i),total=first(/TOTAL:([0-9.]+)/i);
+ const remote=sj?.remote_ip?String(sj.remote_ip):first(/REMOTE:([^\s]+)/i);
+ const dns=sj?.time_namelookup!=null?String(sj.time_namelookup):first(/DNS:([0-9.]+)/i),connect=sj?.time_connect!=null?String(sj.time_connect):first(/CONNECT:([0-9.]+)/i),tls=sj?.time_appconnect!=null?String(sj.time_appconnect):first(/TLS:([0-9.]+)/i),ttfb=sj?.time_starttransfer!=null?String(sj.time_starttransfer):first(/TTFB:([0-9.]+)/i),total=sj?.time_total!=null?String(sj.time_total):first(/TOTAL:([0-9.]+)/i);
  const timing={dns,connect,tls,ttfb,total};
  const num=v=>{const n=Number(String(v).match(/-?\d+(?:\.\d+)?/)?.[0]);return Number.isFinite(n)?n:NaN};
  const L=num(limits[0]),R=num(remaining[0]),used=(Number.isFinite(L)&&Number.isFinite(R)&&L>0)?L-R:NaN,usedPct=Number.isFinite(used)?Math.max(0,Math.min(100,used/L*100)):NaN;
@@ -381,7 +415,7 @@ function analyzeQp(){
  if(Number(ttfb)!==NaN && Number(total)!==NaN)clues.push(`<b>Timing:</b> TTFB ${esc(ttfb)}s of ${esc(total)}s total`);
  const clueHtml=clues.length?`<div class="callout" style="margin-top:10px">${clues.join('<br>')}</div>`:'';
 
- $('#qpResult').innerHTML=`<div class="probe-summary">${cards.join('')}</div>${rateHtml}${cdnHtml}${timingTable}${certHtml}${clueHtml}${bad?'<div class="callout bad" style="margin-top:10px"><b>5xx evidence found:</b> move next to origin reachability, Host/SNI, certificate trust, upstream timing, and backend logs.</div>':''}<div class="why"><b>Why it matters:</b> this parsed view preserves the rich evidence returned by the probe instead of collapsing it to status/server/cache. It is still a client-side clue bundle—not a substitute for WAF, CDN, proxy, or origin logs.</div>`;
+ $('#qpResult').innerHTML=`${structured?`<div class="callout good" style="margin-top:10px"><b>Origin probe transcript recognized.</b> Investigator automatically extracted the embedded JSON from the full terminal output${structured.mode==='balanced'?' using backward-compatible transcript detection':''}. No manual cleanup required.</div>`:''}<div class="probe-summary">${cards.join('')}</div>${rateHtml}${cdnHtml}${timingTable}${certHtml}${clueHtml}${bad?'<div class="callout bad" style="margin-top:10px"><b>5xx evidence found:</b> move next to origin reachability, Host/SNI, certificate trust, upstream timing, and backend logs.</div>':''}<div class="why"><b>Why it matters:</b> this parsed view preserves the rich evidence returned by the probe instead of collapsing it to status/server/cache. It is still a client-side clue bundle—not a substitute for WAF, CDN, proxy, or origin logs.</div>`;
  $('#statusline').textContent=`Domain probe evidence parsed for ${host||'target'} · ${statuses.length} status code${statuses.length===1?'':'s'} · ${limits.length||remaining.length?'rate evidence · ':''}${certPresent?'certificate evidence · ':''}${cloudfront?'CloudFront evidence':''}`;
 }
 function useQpHost(){const h=cleanProbeHost($('#qpDomain').value||'');if(!h)return;['curlHost','oiHost'].forEach(id=>{const e=$('#'+id);if(e)e.value=h});const oh=$('#oiOrigin');if(oh&&!oh.value)oh.value=h;$('#statusline').textContent=`${h} copied into available Investigator host fields.`;quickProbeDialog.close()}
@@ -685,7 +719,9 @@ metrics["probe_checks"] = {
 
 # A non-zero openssl exit may simply mean certificate verification failed.
 # Preserve the evidence rather than aborting the entire diagnostic.
+print("=== WMI_ORIGIN_JSON_BEGIN ===")
 print(json.dumps(metrics, indent=2))
+print("=== WMI_ORIGIN_JSON_END ===")
 PY
 
 PY_RC=$?
